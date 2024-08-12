@@ -112,6 +112,7 @@ class MixtralAttention(nn.Module):
         rope_theta: float = 10000,
         cache_config: Optional[CacheConfig] = None,
         quant_config: Optional[QuantizationConfig] = None,
+        attention_multiplier: Optional[float] = None,
         prefix: str = "",
     ) -> None:
         super().__init__()
@@ -133,7 +134,8 @@ class MixtralAttention(nn.Module):
         self.head_dim = hidden_size // self.total_num_heads
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
-        self.scaling = self.head_dim**-0.5
+        # self.scaling = self.head_dim**-0.5
+        self.scaling = attention_multiplier if attention_multiplier is not None else  self.head_dim**-1
         self.rope_theta = rope_theta
 
         self.qkv_proj = QKVParallelLinear(
@@ -202,7 +204,8 @@ class MixtralDecoderLayer(nn.Module):
             rope_theta=rope_theta,
             cache_config=cache_config,
             quant_config=quant_config,
-            prefix=f"{prefix}.self_attn")
+            prefix=f"{prefix}.self_attn",
+            attention_multiplier=config.attention_multiplier)
         self.block_sparse_moe = MixtralMoE(
             num_experts=config.num_local_experts,
             top_k=config.num_experts_per_tok,
@@ -210,10 +213,13 @@ class MixtralDecoderLayer(nn.Module):
             intermediate_size=config.intermediate_size,
             quant_config=quant_config,
             prefix=f"{prefix}.block_sparse_moe")
+
         self.input_layernorm = RMSNorm(config.hidden_size,
                                        eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(config.hidden_size,
                                                 eps=config.rms_norm_eps)
+
+        self.m_residual = config.m_residual
 
     def forward(
         self,
@@ -224,23 +230,39 @@ class MixtralDecoderLayer(nn.Module):
         residual: Optional[torch.Tensor],
     ) -> torch.Tensor:
         # Self Attention
-        if residual is None:
+        if False:
+            if residual is None:
+                residual = hidden_states
+                hidden_states = self.input_layernorm(hidden_states)
+            else:
+                hidden_states, residual = self.input_layernorm(
+                    hidden_states, residual)
+            hidden_states = self.self_attn(
+                positions=positions,
+                hidden_states=hidden_states,
+                kv_cache=kv_cache,
+                attn_metadata=attn_metadata,
+            )
+
+            # Fully Connected
+            hidden_states, residual = self.post_attention_layernorm(
+                hidden_states, residual)
+            hidden_states = self.block_sparse_moe(hidden_states)
+        else:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
-        else:
-            hidden_states, residual = self.input_layernorm(
-                hidden_states, residual)
-        hidden_states = self.self_attn(
-            positions=positions,
-            hidden_states=hidden_states,
-            kv_cache=kv_cache,
-            attn_metadata=attn_metadata,
-        )
+            hidden_states = self.self_attn(
+                positions=positions,
+                hidden_states=hidden_states,
+                kv_cache=kv_cache,
+                attn_metadata=attn_metadata,
+            )
+            hidden_states = residual + hidden_states * self.m_residual
+            residual = hidden_states
+            hidden_states = self.post_attention_layernorm(hidden_states)
+            hidden_states = self.block_sparse_moe(hidden_states)
+            hidden_states = residual + hidden_states * self.m_residual
 
-        # Fully Connected
-        hidden_states, residual = self.post_attention_layernorm(
-            hidden_states, residual)
-        hidden_states = self.block_sparse_moe(hidden_states)
         return hidden_states, residual
 
 
@@ -266,6 +288,7 @@ class MixtralModel(nn.Module):
             config.hidden_size,
             org_num_embeddings=config.vocab_size,
         )
+        self.m_emb = config.m_emb
 
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers,
@@ -286,6 +309,7 @@ class MixtralModel(nn.Module):
     ) -> torch.Tensor:
         if get_pp_group().is_first_rank:
             hidden_states = self.embed_tokens(input_ids)
+            hidden_states *= self.m_emb
             residual = None
         else:
             assert intermediate_tensors is not None
@@ -382,6 +406,7 @@ class MixtralForCausalLM(nn.Module, SupportsLoRA):
     ) -> Optional[torch.Tensor]:
         logits = self.logits_processor(self.lm_head, hidden_states,
                                        sampling_metadata)
+        logits = logits / self.config.m_width
         return logits
 
     def make_empty_intermediate_tensors(

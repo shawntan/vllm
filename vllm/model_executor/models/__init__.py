@@ -77,7 +77,8 @@ _GENERATION_MODELS = {
     "MedusaModel": ("medusa", "Medusa"),
     "MLPSpeculatorPreTrainedModel": ("mlp_speculator", "MLPSpeculator"),
     "JambaForCausalLM": ("jamba", "JambaForCausalLM"),
-    "GraniteForCausalLM": ("granite", "GraniteForCausalLM")
+    "GraniteForCausalLM": ("granite", "GraniteForCausalLM"),
+    "GraniteMoeForCausalLM": ("granitemoe", "GraniteMoeForCausalLM")
 }
 
 _EMBEDDING_MODELS = {

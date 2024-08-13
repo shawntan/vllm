@@ -20,12 +20,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Inference-only Mixtral model."""
+"""Inference-only GraniteMoe model."""
 from typing import Iterable, List, Optional, Tuple
 
 import torch
 from torch import nn
-from transformers import MixtralConfig
+from transformers import GraniteMoeConfig
 
 from vllm.attention import Attention, AttentionMetadata
 from vllm.config import CacheConfig, LoRAConfig
@@ -49,10 +49,11 @@ from vllm.sequence import IntermediateTensors, SamplerOutput
 
 from .interfaces import SupportsLoRA
 from .utils import is_pp_missing_parameter, make_layers
+from . import mixtral
 
 
-class MixtralMoE(nn.Module):
-    """A tensor-parallel MoE implementation for Mixtral that shards each expert
+class GraniteMoeMoE(nn.Module):
+    """A tensor-parallel MoE implementation for GraniteMoe that shards each expert
     across all ranks.
 
     Each expert's weights are sharded across all ranks and a fused MoE
@@ -101,7 +102,7 @@ class MixtralMoE(nn.Module):
         return final_hidden_states.view(orig_shape)
 
 
-class MixtralAttention(nn.Module):
+class GraniteMoeAttention(nn.Module):
 
     def __init__(
         self,
@@ -112,6 +113,7 @@ class MixtralAttention(nn.Module):
         rope_theta: float = 10000,
         cache_config: Optional[CacheConfig] = None,
         quant_config: Optional[QuantizationConfig] = None,
+        attention_multiplier: Optional[float] = None,
         prefix: str = "",
     ) -> None:
         super().__init__()
@@ -133,7 +135,8 @@ class MixtralAttention(nn.Module):
         self.head_dim = hidden_size // self.total_num_heads
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
-        self.scaling = self.head_dim**-0.5
+        # self.scaling = self.head_dim**-0.5
+        self.scaling = attention_multiplier if attention_multiplier is not None else  self.head_dim**-1
         self.rope_theta = rope_theta
 
         self.qkv_proj = QKVParallelLinear(
@@ -181,11 +184,11 @@ class MixtralAttention(nn.Module):
         return output
 
 
-class MixtralDecoderLayer(nn.Module):
+class GraniteMoeDecoderLayer(nn.Module):
 
     def __init__(
         self,
-        config: MixtralConfig,
+        config: GraniteMoeConfig,
         cache_config: Optional[CacheConfig] = None,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
@@ -194,7 +197,7 @@ class MixtralDecoderLayer(nn.Module):
         self.hidden_size = config.hidden_size
         # Requires transformers > 4.32.0
         rope_theta = getattr(config, "rope_theta", 10000)
-        self.self_attn = MixtralAttention(
+        self.self_attn = GraniteMoeAttention(
             hidden_size=self.hidden_size,
             num_heads=config.num_attention_heads,
             max_position=config.max_position_embeddings,
@@ -202,18 +205,22 @@ class MixtralDecoderLayer(nn.Module):
             rope_theta=rope_theta,
             cache_config=cache_config,
             quant_config=quant_config,
-            prefix=f"{prefix}.self_attn")
-        self.block_sparse_moe = MixtralMoE(
+            prefix=f"{prefix}.self_attn",
+            attention_multiplier=config.attention_multiplier)
+        self.block_sparse_moe = GraniteMoeMoE(
             num_experts=config.num_local_experts,
             top_k=config.num_experts_per_tok,
             hidden_size=config.hidden_size,
             intermediate_size=config.intermediate_size,
             quant_config=quant_config,
             prefix=f"{prefix}.block_sparse_moe")
+
         self.input_layernorm = RMSNorm(config.hidden_size,
                                        eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(config.hidden_size,
                                                 eps=config.rms_norm_eps)
+
+        self.residual_multiplier = config.residual_multiplier
 
     def forward(
         self,
@@ -224,31 +231,47 @@ class MixtralDecoderLayer(nn.Module):
         residual: Optional[torch.Tensor],
     ) -> torch.Tensor:
         # Self Attention
-        if residual is None:
+        if False:
+            if residual is None:
+                residual = hidden_states
+                hidden_states = self.input_layernorm(hidden_states)
+            else:
+                hidden_states, residual = self.input_layernorm(
+                    hidden_states, residual)
+            hidden_states = self.self_attn(
+                positions=positions,
+                hidden_states=hidden_states,
+                kv_cache=kv_cache,
+                attn_metadata=attn_metadata,
+            )
+
+            # Fully Connected
+            hidden_states, residual = self.post_attention_layernorm(
+                hidden_states, residual)
+            hidden_states = self.block_sparse_moe(hidden_states)
+        else:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
-        else:
-            hidden_states, residual = self.input_layernorm(
-                hidden_states, residual)
-        hidden_states = self.self_attn(
-            positions=positions,
-            hidden_states=hidden_states,
-            kv_cache=kv_cache,
-            attn_metadata=attn_metadata,
-        )
+            hidden_states = self.self_attn(
+                positions=positions,
+                hidden_states=hidden_states,
+                kv_cache=kv_cache,
+                attn_metadata=attn_metadata,
+            )
+            hidden_states = residual + hidden_states * self.residual_multiplier
+            residual = hidden_states
+            hidden_states = self.post_attention_layernorm(hidden_states)
+            hidden_states = self.block_sparse_moe(hidden_states)
+            hidden_states = residual + hidden_states * self.residual_multiplier
 
-        # Fully Connected
-        hidden_states, residual = self.post_attention_layernorm(
-            hidden_states, residual)
-        hidden_states = self.block_sparse_moe(hidden_states)
         return hidden_states, residual
 
 
-class MixtralModel(nn.Module):
+class GraniteMoeModel(nn.Module):
 
     def __init__(
         self,
-        config: MixtralConfig,
+        config: GraniteMoeConfig,
         cache_config: Optional[CacheConfig] = None,
         quant_config: Optional[QuantizationConfig] = None,
         lora_config: Optional[LoRAConfig] = None,
@@ -266,10 +289,11 @@ class MixtralModel(nn.Module):
             config.hidden_size,
             org_num_embeddings=config.vocab_size,
         )
+        self.embedding_multiplier = config.embedding_multiplier
 
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers,
-            lambda prefix: MixtralDecoderLayer(
+            lambda prefix: GraniteMoeDecoderLayer(
                 config, cache_config, quant_config=quant_config, prefix=prefix
             ),
             prefix=f"{prefix}.layers")
@@ -286,6 +310,7 @@ class MixtralModel(nn.Module):
     ) -> torch.Tensor:
         if get_pp_group().is_first_rank:
             hidden_states = self.embed_tokens(input_ids)
+            hidden_states *= self.embedding_multiplier
             residual = None
         else:
             assert intermediate_tensors is not None
@@ -305,7 +330,7 @@ class MixtralModel(nn.Module):
         return hidden_states
 
 
-class MixtralForCausalLM(nn.Module, SupportsLoRA):
+class GraniteMoeForCausalLM(nn.Module, SupportsLoRA):
     fall_back_to_pt_during_load = False
 
     packed_modules_mapping = {
@@ -331,7 +356,7 @@ class MixtralForCausalLM(nn.Module, SupportsLoRA):
 
     def __init__(
         self,
-        config: MixtralConfig,
+        config: GraniteMoeConfig,
         cache_config: Optional[CacheConfig] = None,
         quant_config: Optional[QuantizationConfig] = None,
         lora_config: Optional[LoRAConfig] = None,
@@ -341,7 +366,7 @@ class MixtralForCausalLM(nn.Module, SupportsLoRA):
         self.config = config
         self.lora_config = lora_config
 
-        self.model = MixtralModel(config,
+        self.model = GraniteMoeModel(config,
                                   cache_config,
                                   quant_config,
                                   lora_config=lora_config,
@@ -359,6 +384,10 @@ class MixtralForCausalLM(nn.Module, SupportsLoRA):
             if not lora_config else lora_config.lora_vocab_padding_size,
             quant_config=quant_config,
         )
+        if config.tie_word_embeddings:
+            self.lm_head.weight = self.model.embed_tokens.weight
+
+
         self.logits_processor = LogitsProcessor(self.unpadded_vocab_size,
                                                 config.vocab_size)
         self.sampler = Sampler()
@@ -375,13 +404,11 @@ class MixtralForCausalLM(nn.Module, SupportsLoRA):
                                    attn_metadata, intermediate_tensors)
         return hidden_states
 
-    def compute_logits(
-        self,
-        hidden_states: torch.Tensor,
-        sampling_metadata: SamplingMetadata,
-    ) -> Optional[torch.Tensor]:
+    def compute_logits(self, hidden_states: torch.Tensor,
+                       sampling_metadata: SamplingMetadata) -> torch.Tensor:
         logits = self.logits_processor(self.lm_head, hidden_states,
                                        sampling_metadata)
+        logits = logits / self.config.logits_scaling
         return logits
 
     def make_empty_intermediate_tensors(
@@ -407,71 +434,29 @@ class MixtralForCausalLM(nn.Module, SupportsLoRA):
         return next_tokens
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        stacked_params_mapping = [
-            # (param_name, shard_name, shard_id)
-            ("qkv_proj", "q_proj", "q"),
-            ("qkv_proj", "k_proj", "k"),
-            ("qkv_proj", "v_proj", "v"),
-        ]
-
-        # Params for weights, fp8 weight scales, fp8 activation scales
-        # (param_name, weight_name, expert_id, shard_id)
-        expert_params_mapping = FusedMoE.make_expert_params_mapping(
-            ckpt_gate_proj_name="w1",
-            ckpt_down_proj_name="w2",
-            ckpt_up_proj_name="w3",
-            num_experts=self.config.num_local_experts)
-
-        params_dict = dict(self.named_parameters())
-        for name, loaded_weight in weights:
-            if "rotary_emb.inv_freq" in name:
-                continue
-
-            for (param_name, weight_name, shard_id) in stacked_params_mapping:
-                if weight_name not in name:
-                    continue
-                name = name.replace(weight_name, param_name)
-                # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
-                    continue
-                # Skip layers on other devices.
-                if is_pp_missing_parameter(name, self):
-                    continue
-
-                param = params_dict[name]
-                weight_loader = param.weight_loader
-                weight_loader(param, loaded_weight, shard_id)
-                break
+        named_params = dict(self.named_parameters())
+        new_weights = {}
+        for n, p in weights:
+            if n.endswith('.block_sparse_moe.input_linear.weight'):
+                for e in range(p.size(0)):
+                    w1_name = n.replace('.block_sparse_moe.input_linear.weight', ".block_sparse_moe.experts.%d.w1.weight" % e)
+                    w3_name = n.replace('.block_sparse_moe.input_linear.weight', ".block_sparse_moe.experts.%d.w3.weight" % e)
+                    w1_param, w3_param = p[e].chunk(2, dim=0)
+                    assert w1_name not in new_weights
+                    assert w3_name not in new_weights
+                    new_weights[w1_name] = w1_param
+                    new_weights[w3_name] = w3_param
+            elif n.endswith('.block_sparse_moe.output_linear.weight'):
+                for e in range(p.size(0)):
+                    w2_name = n.replace('.block_sparse_moe.output_linear.weight', ".block_sparse_moe.experts.%d.w2.weight" % e)
+                    w2_param = p[e]
+                    assert w2_name not in new_weights
+                    new_weights[w2_name] = w2_param
+            elif n.endswith('.block_sparse_moe.router.layer.weight'):
+                gate_name = n.replace('.block_sparse_moe.router.layer.weight', ".block_sparse_moe.gate.weight")
+                assert gate_name not in new_weights
+                new_weights[gate_name] = p
             else:
-                for mapping in expert_params_mapping:
-                    param_name, weight_name, expert_id, shard_id = mapping
-                    if weight_name not in name:
-                        continue
-                    name = name.replace(weight_name, param_name)
-                    # Skip layers on other devices.
-                    if is_pp_missing_parameter(name, self):
-                        continue
-                    param = params_dict[name]
-                    weight_loader = param.weight_loader
-                    weight_loader(param,
-                                  loaded_weight,
-                                  weight_name,
-                                  shard_id=shard_id,
-                                  expert_id=expert_id)
-                    break
-                else:
-                    # Skip loading extra bias for GPTQ models.
-                    if name.endswith(".bias") and name not in params_dict:
-                        continue
-                    # Skip layers on other devices.
-                    if is_pp_missing_parameter(name, self):
-                        continue
-                    # Remapping the name of FP8 kv-scale.
-                    name = maybe_remap_kv_scale_name(name, params_dict)
-                    if name is None:
-                        continue
+                new_weights[n] = p
+        mixtral.MixtralForCausalLM.load_weights(self, new_weights.items())
 
-                    param = params_dict[name]
-                    weight_loader = getattr(param, "weight_loader",
-                                            default_weight_loader)
-                    weight_loader(param, loaded_weight)

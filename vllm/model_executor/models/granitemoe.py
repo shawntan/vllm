@@ -42,20 +42,17 @@ from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.sampler import Sampler
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     DEFAULT_VOCAB_PADDING_SIZE, ParallelLMHead, VocabParallelEmbedding)
-from vllm.model_executor.model_loader.weight_utils import (
-    default_weight_loader, maybe_remap_kv_scale_name)
 from vllm.model_executor.sampling_metadata import SamplingMetadata
 from vllm.sequence import IntermediateTensors, SamplerOutput
 
-from .interfaces import SupportsLoRA
-from .utils import is_pp_missing_parameter, make_layers
 from . import mixtral
+from .interfaces import SupportsLoRA
+from .utils import make_layers
 
 
 class GraniteMoeMoE(nn.Module):
-    """A tensor-parallel MoE implementation for GraniteMoe that shards each expert
-    across all ranks.
-
+    """A tensor-parallel MoE implementation for GraniteMoe that shards each
+    expert across all ranks.
     Each expert's weights are sharded across all ranks and a fused MoE
     kernel is used for the forward pass, and finally we reduce the outputs
     across ranks.
@@ -136,7 +133,8 @@ class GraniteMoeAttention(nn.Module):
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
         # self.scaling = self.head_dim**-0.5
-        self.scaling = attention_multiplier if attention_multiplier is not None else  self.head_dim**-1
+        self.scaling = (attention_multiplier if attention_multiplier
+                        is not None else self.head_dim**-1)
         self.rope_theta = rope_theta
 
         self.qkv_proj = QKVParallelLinear(
@@ -367,10 +365,10 @@ class GraniteMoeForCausalLM(nn.Module, SupportsLoRA):
         self.lora_config = lora_config
 
         self.model = GraniteMoeModel(config,
-                                  cache_config,
-                                  quant_config,
-                                  lora_config=lora_config,
-                                  prefix="model")
+                                     cache_config,
+                                     quant_config,
+                                     lora_config=lora_config,
+                                     prefix="model")
         self.unpadded_vocab_size = config.vocab_size
         if lora_config:
             self.unpadded_vocab_size += lora_config.lora_extra_vocab_size
@@ -386,7 +384,6 @@ class GraniteMoeForCausalLM(nn.Module, SupportsLoRA):
         )
         if config.tie_word_embeddings:
             self.lm_head.weight = self.model.embed_tokens.weight
-
 
         self.logits_processor = LogitsProcessor(self.unpadded_vocab_size,
                                                 config.vocab_size)
@@ -434,13 +431,16 @@ class GraniteMoeForCausalLM(nn.Module, SupportsLoRA):
         return next_tokens
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        named_params = dict(self.named_parameters())
         new_weights = {}
         for n, p in weights:
             if n.endswith('.block_sparse_moe.input_linear.weight'):
                 for e in range(p.size(0)):
-                    w1_name = n.replace('.block_sparse_moe.input_linear.weight', ".block_sparse_moe.experts.%d.w1.weight" % e)
-                    w3_name = n.replace('.block_sparse_moe.input_linear.weight', ".block_sparse_moe.experts.%d.w3.weight" % e)
+                    w1_name = n.replace(
+                        '.block_sparse_moe.input_linear.weight',
+                        ".block_sparse_moe.experts.%d.w1.weight" % e)
+                    w3_name = n.replace(
+                        '.block_sparse_moe.input_linear.weight',
+                        ".block_sparse_moe.experts.%d.w3.weight" % e)
                     w1_param, w3_param = p[e].chunk(2, dim=0)
                     assert w1_name not in new_weights
                     assert w3_name not in new_weights
@@ -448,15 +448,17 @@ class GraniteMoeForCausalLM(nn.Module, SupportsLoRA):
                     new_weights[w3_name] = w3_param
             elif n.endswith('.block_sparse_moe.output_linear.weight'):
                 for e in range(p.size(0)):
-                    w2_name = n.replace('.block_sparse_moe.output_linear.weight', ".block_sparse_moe.experts.%d.w2.weight" % e)
+                    w2_name = n.replace(
+                        '.block_sparse_moe.output_linear.weight',
+                        ".block_sparse_moe.experts.%d.w2.weight" % e)
                     w2_param = p[e]
                     assert w2_name not in new_weights
                     new_weights[w2_name] = w2_param
             elif n.endswith('.block_sparse_moe.router.layer.weight'):
-                gate_name = n.replace('.block_sparse_moe.router.layer.weight', ".block_sparse_moe.gate.weight")
+                gate_name = n.replace('.block_sparse_moe.router.layer.weight',
+                                      ".block_sparse_moe.gate.weight")
                 assert gate_name not in new_weights
                 new_weights[gate_name] = p
             else:
                 new_weights[n] = p
         mixtral.MixtralForCausalLM.load_weights(self, new_weights.items())
-
